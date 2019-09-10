@@ -4,32 +4,20 @@ NimbleCSV.define(ChaseParser, separator: ",")
 defmodule BudgetReconciler do
   use Timex
 
-  alias BudgetReconciler.{YNAB, Hills, Chase}
+  alias BudgetReconciler.Filters
 
   @moduledoc """
   Documentation for BudgetReconciler.
   """
 
-  @doc """
-  Hello world.
-
-  ## Examples
-
-      iex> BudgetReconciler.hello()
-      :world
-
-  """
-  def hello do
-    :world
-  end
-
-  def ynab_data(which \\ "hills") do
+  def ynab_data(which) do
     {:ok, data} = File.read("ynab_#{which}_data.json")
     ynab = Jason.decode!(data)
     transactions = get_in(ynab, ["data", "transactions"])
 
     Enum.map(transactions, fn d ->
       %{
+        source: :ynab,
         amount: d["amount"],
         account_name: d["account_name"],
         approved: d["approved"],
@@ -59,6 +47,7 @@ defmodule BudgetReconciler do
         end
 
       %{
+        source: :hills,
         account_number: account_number,
         post_date: dt,
         check: check,
@@ -79,6 +68,7 @@ defmodule BudgetReconciler do
     |> ChaseParser.parse_string()
     |> Enum.map(fn [transaction_date, post_date, description, category, type, amount] ->
       %{
+        source: :chase,
         transaction_date: Timex.parse!(transaction_date, "{0M}/{0D}/{YYYY}") |> Timex.to_date(),
         post_date: Timex.parse!(post_date, "{0M}/{0D}/{YYYY}") |> Timex.to_date(),
         description: description,
@@ -87,6 +77,22 @@ defmodule BudgetReconciler do
         amount: parse_chase_amount(amount)
       }
     end)
+  end
+
+  def record_string(%{:source => :ynab} = record) do
+    fields = [record.date, amount_string(record.amount), record.payee_name, "\n"]
+    Enum.join(fields, " ")
+  end
+
+  def record_string(record) do
+    fields = [record.post_date, amount_string(record.amount), record.description]
+    Enum.join(fields, " ")
+  end
+
+  def amount_string(amount) do
+    amount = amount / 1000
+    amount = Float.round(amount,2)
+    to_string(amount)
   end
 
   defp parse_chase_amount(string) do
@@ -113,95 +119,58 @@ defmodule BudgetReconciler do
     end
   end
 
-  def load() do
-    {
-      ynab_data(),
-      hills_data()
-    }
+  def compare(what, days_diff \\ 2)
+  def compare(account, days_diff) when is_atom(account) do
+    {other_name, data} = case account do
+      :hills ->
+        ynab = ynab_data("hills")
+        hills = hills_data()
+        {"Hills", {ynab,hills}}
+      :chase ->
+        ynab = ynab_data("chase")
+        chase = chase_data()
+        {"Chase", {ynab,chase}}
+    end
+
+    compare(other_name, data, days_diff)
   end
 
-  def ynab_transactions_not_in_hills_bank({ynab, hills}) do
-    unreconciled = Enum.filter(ynab, YNAB.not_reconciled?())
-    min_date = Enum.min_by(unreconciled, fn x -> x[:date] end) |> Map.get(:date)
-    max_date = Enum.max_by(unreconciled, fn x -> x[:date] end) |> Map.get(:date)
+  def compare(other_name, {ynab, other}, days_diff) do
+    min_date = Enum.min_by(ynab, fn x -> x[:date] end) |> Map.get(:date)
+    max_date = Enum.max_by(ynab, fn x -> x[:date] end) |> Map.get(:date)
 
-    hills_in_date = Enum.filter(hills, Hills.between(min_date, max_date))
+    other_in_date  = Enum.filter(other, Filters.between(min_date, max_date))
 
-    {_, not_in_hills} = Enum.split_with(unreconciled, YNAB.in_hills(hills))
-    {_, not_in_ynab} = Enum.split_with(hills_in_date, Hills.in_ynab(ynab))
+    {in_other, not_in_other} = Enum.split_with(ynab, Filters.in_other(other, days_diff))
+    {in_ynab, not_in_ynab} = Enum.split_with(other_in_date , Filters.in_ynab(ynab, days_diff))
 
+    IO.puts("#{Enum.count(ynab)} records in YNAB from #{min_date} to #{max_date}")
+    IO.puts("#{Enum.count(other)} records in #{other_name} (#{Enum.count(other_in_date)}) from #{min_date} to #{max_date}")
+
+    IO.puts("")
     IO.puts("############################################")
-    IO.puts("       NOT IN HILLS BANK                    ")
-    IO.puts("############################################")
-    IO.inspect(not_in_hills)
+    IO.puts("       NOT IN #{other_name} BANK                    ")
+    IO.puts("")
+    not_in_other |> Enum.map(&record_string/1) |> IO.puts
+    IO.puts("#{Enum.count(not_in_other)} records not in #{other_name}")
+    IO.puts("#{Enum.count(in_other)} records in #{other_name}")
     IO.puts("")
     IO.puts("")
     IO.puts("############################################")
     IO.puts("               NOT IN YNAB                  ")
-    IO.puts("############################################")
     IO.puts("")
-    IO.inspect(not_in_ynab)
+    IO.puts("")
+    not_in_ynab |> Enum.map(&record_string/1) |> IO.puts
+    IO.puts("#{Enum.count(not_in_ynab)} records not in YNAB")
+    IO.puts("#{Enum.count(in_ynab)} records in YNAB")
 
+    
     :ok
   end
 
-  def is_same?(ynab_tx, hills_tx) do
-    if ynab_tx.amount == hills_tx.amount do
-      days_diff = Timex.diff(ynab_tx.date, hills_tx.post_date, :days) |> abs()
 
-      days_diff <= 2
-    else
-      false
-    end
-  end
+  defmodule Filters do
 
-  defmodule Hills do
-    def with_amount(amount) do
-      fn tx ->
-        tx[:amount] == amount
-      end
-    end
-
-    def in_ynab(ynab) do
-      fn hills_tx ->
-        Enum.any?(ynab, &BudgetReconciler.is_same?(&1, hills_tx))
-      end
-    end
-
-    def between(start_date \\ ~D[2019-03-01], end_date \\ ~D[2019-09-01]) do
-      fn hills_tx ->
-        starts_after = Date.compare(hills_tx[:post_date], start_date) in [:gt, :eq]
-        starts_before = Date.compare(hills_tx[:post_date], end_date) in [:lt, :eq]
-
-        starts_after && starts_before
-      end
-    end
-  end
-
-  defmodule Chase do
-    def with_amount(amount) do
-      fn tx ->
-        tx[:amount] == amount
-      end
-    end
-
-    def in_ynab(ynab) do
-      fn hills_tx ->
-        Enum.any?(ynab, &BudgetReconciler.is_same?(&1, hills_tx))
-      end
-    end
-
-    def between(start_date \\ ~D[2019-03-01], end_date \\ ~D[2019-09-01]) do
-      fn hills_tx ->
-        starts_after = Date.compare(hills_tx[:post_date], start_date) in [:gt, :eq]
-        starts_before = Date.compare(hills_tx[:post_date], end_date) in [:lt, :eq]
-
-        starts_after && starts_before
-      end
-    end
-  end
-
-  defmodule YNAB do
     def reconciled?() do
       fn ynab_tx ->
         ynab_tx[:cleared] == "reconciled"
@@ -214,16 +183,42 @@ defmodule BudgetReconciler do
       end
     end
 
-    def in_hills(hills) do
-      fn ynab_tx ->
-        Enum.any?(hills, &BudgetReconciler.is_same?(ynab_tx, &1))
+    def with_amount(amount) do
+      fn tx ->
+        tx[:amount] == amount
       end
     end
 
-    def in_chase(chase) do
+    def between(start_date \\ ~D[2019-03-01], end_date \\ ~D[2019-09-01]) do
+      fn hills_tx ->
+        starts_after = Date.compare(hills_tx[:post_date], start_date) in [:gt, :eq]
+        starts_before = Date.compare(hills_tx[:post_date], end_date) in [:lt, :eq]
+
+        starts_after && starts_before
+      end
+    end
+
+    def in_other(other, days_diff \\ 2) do
       fn ynab_tx ->
-        Enum.any?(chase, &BudgetReconciler.is_same?(ynab_tx, &1))
+        Enum.any?(other, &is_same?(ynab_tx, &1, days_diff))
+      end
+    end
+
+    def in_ynab(ynab, days_diff \\ 2) do
+      fn other_tx ->
+        Enum.any?(ynab, &is_same?(&1, other_tx, days_diff))
+      end
+    end
+
+    def is_same?(ynab_tx, hills_tx, days_diff_limit \\ 2) do
+      if abs(ynab_tx.amount - hills_tx.amount) <= 1 do
+        days_diff = Timex.diff(ynab_tx.date, hills_tx.post_date, :days) |> abs()
+
+        days_diff <= days_diff_limit
+      else
+        false
       end
     end
   end
+
 end
